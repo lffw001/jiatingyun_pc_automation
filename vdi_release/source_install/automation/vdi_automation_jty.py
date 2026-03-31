@@ -115,6 +115,7 @@ class VDIStateMachine:
         self.cdp_url = "http://localhost:9222"
         self.session = None
         self.last_keepalive = time.time()
+        self.success_file = '/config/automation_success.txt'
         self.state = State.UNKNOWN
         self.last_state = None
         self.state_start_time = time.time()
@@ -603,8 +604,18 @@ class VDIStateMachine:
                     "y": ry
                 })
                 logger.info(f"[ACT] IN_SESSION: Mouse Jiggle to ({rx}, {ry}) to keep alive.")
+                self.write_success_marker()
         except Exception as e:
             logger.error(f"Heartbeat Jiggle Failed: {e}")
+
+    def write_success_marker(self):
+        """写入成功标志文件，内容为当前操作的时间"""
+        try:
+            with open(self.success_file, 'w') as f:
+                f.write(time.strftime("%Y-%m-%d %H:%M:%S"))
+            logger.info(f"[SUCCESS] Wrote success marker to {self.success_file}")
+        except Exception as e:
+            logger.error(f"Failed to write success marker: {e}")
 
     def handle_guide_state(self):
         """处理 GUIDE 状态：探测并关闭引导页"""
@@ -723,6 +734,8 @@ class VDIStateMachine:
                 # 2. State Transition
                 if new_state != self.state:
                     logger.info(f"TRANSITION: {self.state.name} -> {new_state.name}")
+                    if new_state == State.IN_SESSION:
+                        self.write_success_marker()
                     self.state = new_state
                     # 记录机器人进入当前状态的那一刻时间。
                     self.state_start_time = time.time()
