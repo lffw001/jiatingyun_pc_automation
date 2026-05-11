@@ -107,6 +107,7 @@ class State(Enum):
     WAIT = 6          # 冲突等待
     UPDATING = 7      # 发现新版本弹窗状态
     GUIDE = 8         # 新手引导页状态
+    PRIVACY = 9       # 隐私协议弹窗状态
 
 # --- MAIN CONTROLLER ---
 class VDIStateMachine:
@@ -303,7 +304,42 @@ class VDIStateMachine:
             return False
             
         target_deb = "/tmp/vdi_update_manual.deb"
-        logger.info(f"[UPDATE] Found URL: {url}. Starting manual download...")
+        start_time_file = "/tmp/.vdi_update_manual.start"
+        now = time.time()
+
+        if os.path.exists(target_deb):
+            if os.path.exists(start_time_file):
+                try:
+                    with open(start_time_file, "r") as f:
+                        content = f.read().strip()
+                        birth_time = float(content) if content else 0
+                    # 如果超过 12 小时，清理掉，后面会自动重置为 0
+                    if (now - birth_time) > 43200:
+                        logger.info("[UPDATE] Stale deb (>12h). Cleaning up.")
+                        os.remove(target_deb)
+                        file_exists_and_valid = False
+                    else:
+                        file_exists_and_valid = True
+                except:
+                    os.remove(target_deb)
+                    file_exists_and_valid = False
+            else:
+                # deb 在但 start 不在，非法，重置
+                os.remove(target_deb)
+                file_exists_and_valid = False
+        else:
+            file_exists_and_valid = False
+
+        # --- 统一出口：如果状态不合法或文件不存在，强制重置影子文件为 0 ---
+        if not file_exists_and_valid:
+            with open(start_time_file, "w") as f: f.write("0")
+
+        # 启动下载前的统一准备：如果影子文件里是初始值，则填入当前真实时间
+        with open(start_time_file, "r") as f:
+            if f.read().strip() in ["0", ""]:
+                with open(start_time_file, "w") as f: f.write(str(now))
+
+        logger.info(f"[UPDATE] Processing URL: {url}...")
         
         try:
             # A. 增强版下载：包含断点续传和自动重试
@@ -409,8 +445,8 @@ class VDIStateMachine:
         return State.DESKTOP_LIST
 
     def check_login_page_state(self, s, url):
-        """判定是否在登录页 (#/login)"""
-        if "login" not in url:
+        """判定是否在登录页 (#/login 或 start.html)"""
+        if "login" not in url and "start.html" not in url:
             return None
             
         # 识别具体登录子视图供日志参考
@@ -443,23 +479,59 @@ class VDIStateMachine:
             return State.UPDATING
         return None
 
+    def check_privacy_state(self):
+        """独立检测：探测是否存在隐私协议弹窗"""
+        try:
+            with urllib.request.urlopen(f"{self.cdp_url}/json", timeout=2) as f:
+                pages = json.load(f)
+                for p in pages:
+                    if p['type'] != 'page': continue
+                    ws_url = p.get('webSocketDebuggerUrl')
+                    if not ws_url: continue
+                    
+                    tmp_s = CDPSession(ws_url)
+                    try:
+                        # 只要搜到按钮，不管是否可见，都认为进入了 PRIVACY 状态
+                        js = """(function(){
+                            let btn = document.querySelector('.dialog-btn-sure') || 
+                                      Array.from(document.querySelectorAll('div, button')).find(e => e.innerText.trim().includes('已满14周岁并同意'));
+                            return !!btn;
+                        })()"""
+                        if tmp_s.evaluate(js):
+                            logger.info(f"[SENSE] Privacy Dialog detected on page: {p.get('title')}")
+                            return State.PRIVACY
+                    except:
+                        pass
+                    finally:
+                        tmp_s.close()
+        except Exception as e:
+            logger.error(f"Check Privacy Exception: {e}")
+        return None
+
     # --- SENSE (State Detection) 建议应该倒过来看状态---
     def detect_state(self):
-        # 0. 引导页判定 (优先级最高，因为它是交互遮挡，且可能与任何状态并存) 会和IN_SESSION 并存 优先判断
+        # 0. 隐私协议判定 (完全独立检测，置顶最高优先级)
+        res = self.check_privacy_state()
+        if res: return res
+
+        # 1. 尝试获取主浏览器会话
+        s = self.get_cdp_session()
+
+        # 2. 引导页判定 (不需要 s)
         res = self.check_guide_state()
         if res: return res
 
-        # 1. 判定是否已经连接电脑桌面（出现桌面），会话进程状态
+        # 3. 判定是否已经连接电脑桌面（出现桌面），会话进程状态
         res = self.check_session_state()
         if res: return res
 
-        # 2. 判定更新弹窗状态
+        # 4. 判定更新弹窗状态
         res = self.check_update_state()
         if res: return res
 
-        # 3. 获取浏览器会话进行 UI 判定
-        s = self.get_cdp_session()
+        # 如果前面都没匹配到，且确实拿不到会话，判定为未知
         if not s:
+            logger.warning("[SENSE] State: UNKNOWN (Failed to get CDP Session)")
             return State.UNKNOWN
 
         try:
@@ -478,11 +550,13 @@ class VDIStateMachine:
             if res: return res
 
             if "error" in current_url:
-                logger.warning("[SENSE] Error Page Detected")
+                logger.warning(f"[SENSE] State: UNKNOWN (Error page detected: {current_url})")
                 return State.UNKNOWN
-
+                
+            # 调试：所有判定落空
+            logger.warning(f"[SENSE] State: UNKNOWN (No match for URL: {current_url})")
         except Exception as e:
-            logger.error(f"[SENSE] Error during detection: {e}")
+            logger.error(f"[SENSE] State: UNKNOWN (Detection eval crash: {e})")
             
         return State.UNKNOWN
 
@@ -639,6 +713,51 @@ class VDIStateMachine:
         except Exception as e:
             logger.error(f"[ACT] Guide Clearing Failed: {e}")
             pass
+    def handle_privacy_state(self):
+        """处理隐私协议弹窗状态：寻找并点击同意按钮"""
+        now = time.time()
+        if (now - self.last_action_time) < 5:
+            return
+
+        self.last_action_time = now
+        logger.info("[ACT] PRIVACY: Found privacy dialog. Executing independent handler...")
+
+        try:
+            # 独立获取所有窗口列表
+            with urllib.request.urlopen(f"{self.cdp_url}/json", timeout=2) as f:
+                pages = json.load(f)
+                for p in pages:
+                    if p['type'] != 'page': continue
+                    ws_url = p.get('webSocketDebuggerUrl')
+                    if not ws_url: continue
+                    
+                    tmp_s = CDPSession(ws_url)
+                    try:
+                        # 核心方案：精准定位类名 + 物理点击模拟
+                        js_trigger = """(function(){
+                            try {
+                                let btn = document.querySelector('.dialog-btn-sure') || 
+                                          Array.from(document.querySelectorAll('div, button')).find(e => e.innerText.trim().includes('已满14周岁并同意'));
+                                if(btn) {
+                                    let rect = btn.getBoundingClientRect();
+                                    btn.click();
+                                    return {x: rect.left + rect.width/2, y: rect.top + rect.height/2, text: btn.innerText.trim()};
+                                }
+                            } catch(e) { return 'ERROR'; }
+                            return null;
+                        })()"""
+                        pos = tmp_s.evaluate(js_trigger)
+                        if pos and isinstance(pos, dict):
+                            logger.info(f"[ACT] Found Privacy Button '{pos.get('text')}', clicking at {pos['x']},{pos['y']}")
+                            # 执行物理点击补刀
+                            tmp_s.send("Input.dispatchMouseEvent", {"type": "mousePressed", "x": pos['x'], "y": pos['y'], "button": "left", "clickCount": 1})
+                            tmp_s.send("Input.dispatchMouseEvent", {"type": "mouseReleased", "x": pos['x'], "y": pos['y'], "button": "left", "clickCount": 1})
+                            time.sleep(1)
+                            return # 处理成功
+                    finally:
+                        tmp_s.close()
+        except Exception as e:
+            logger.error(f"Independent privacy handler failed: {e}")
 
     def handle_in_session_state(self):
         """处理会话运行中状态"""
@@ -720,6 +839,10 @@ class VDIStateMachine:
 
         elif current_state == State.GUIDE:
             self.handle_guide_state()
+            return
+
+        elif current_state == State.PRIVACY:
+            self.handle_privacy_state()
             return
 
     # --- LOOP ---
