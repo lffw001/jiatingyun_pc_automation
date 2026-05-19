@@ -123,6 +123,10 @@ class VDIStateMachine:
         self.last_action_time = 0    # 追踪最后一次尝试操作的时间
         self.last_connecting_log = 0 # 追踪 CONNECTING 状态的最后一次日志时间
         self.last_healthy_time = time.time() # 新增：看门狗，记录最后一次正常业务状态的时间
+        # 省资源模式相关状态变量
+        self.session_connected_time = None # 记录连入桌面的开始时刻（秒级时间戳，用于计算已连接多久，到期自动断开）
+        self.last_disconnect_time = 0      # 记录断开会话的终止时刻（秒级时间戳，用于计算已断开多久，在冷静期内拦截连接）
+        self._last_saving_log_time = 0     # 记录冷静期倒计时日志的上一次打印时刻（秒级时间戳，用于将日志输出控制为每 60 秒一次）
 
     def reload_config(self):
         self.config = load_config()
@@ -136,6 +140,12 @@ class VDIStateMachine:
         self.conflict_wait = int(self.config.get('conflict_wait_seconds', 300))
         self.keepalive_interval = random.randint(self.min_int, self.max_int)
         self.last_conflict_log = 0
+        
+        # 省资源模式保活配置读取
+        self.enable_pc_saving = self.config.get('enable_pc_saving', 'false').lower() == 'true' # 是否开启省资源保活模式
+        self.vdi_session_duration = int(self.config.get('vdi_session_duration_seconds', 20)) # 每次连入桌面后保持连接的持续时间（秒）
+        self.vdi_disconnect_duration = int(self.config.get('vdi_disconnect_duration_seconds', 1200)) # 断开连接后等待重新连接的冷静期时长（秒）
+
 
     def get_cdp_session(self):
         """Get or refresh CDP session"""
@@ -642,6 +652,18 @@ class VDIStateMachine:
     def handle_desktop_list_state(self, duration):
         """处理列表页逻辑：点击连接指定索引的桌面"""
         now = time.time()
+        
+        # 省资源模式特殊逻辑：如果在断开等待期，不进行连接
+        if self.enable_pc_saving and self.last_disconnect_time > 0:
+            elapsed = now - self.last_disconnect_time
+            if elapsed < self.vdi_disconnect_duration:
+                remaining = self.vdi_disconnect_duration - elapsed
+                # 控制日志打印频率，每 60 秒打印一次
+                if now - self._last_saving_log_time >= 60:
+                    logger.info(f"[PC SAVING] Disconnected. Waiting to refresh. Remaining: {remaining:.0f}s ({remaining/60:.1f} mins)")
+                    self._last_saving_log_time = now
+                return
+
         if duration > 5 and (now - self.last_action_time) > 10:
             logger.info(f"[ACT] LIST: Connecting to desktop index {self.connect_index}...")
             self.last_action_time = now
@@ -763,6 +785,24 @@ class VDIStateMachine:
         """处理会话运行中状态"""
         # 执行鼠标随机移动（Jiggle）以防止超时断开
         now = time.time()
+        
+        # 省资源模式特殊逻辑：到达时间后自动断开以节省时间/资源
+        if self.enable_pc_saving:
+            if self.session_connected_time is None:
+                self.session_connected_time = now
+                logger.info(f"[PC SAVING] Session detected. Initializing session_connected_time.")
+                
+            elapsed = now - self.session_connected_time
+            if elapsed >= self.vdi_session_duration:
+                logger.info(f"[PC SAVING] Session duration reached ({elapsed:.1f}s >= {self.vdi_session_duration}s). Disconnecting VDI to save resources.")
+                # 杀死 VDI 进程
+                subprocess.call(["pkill", "-9", "-f", "uSmartView"])
+                # 记录断开时间，重置连接时间
+                self.last_disconnect_time = now
+                self.session_connected_time = None
+                return
+
+        # 执行鼠标随机移动（Jiggle）以防止超时断开
         if now - self.last_keepalive > self.keepalive_interval:
             self._do_mouse_jiggle()
             self.last_keepalive = now
@@ -845,6 +885,22 @@ class VDIStateMachine:
             self.handle_privacy_state()
             return
 
+    def on_state_transition(self, old_state, new_state):
+        """状态过渡的业务生命周期钩子 (完全解耦业务副作用)"""
+        # 1. 成功进入会话状态
+        if new_state == State.IN_SESSION:
+            self.write_success_marker()
+            if self.enable_pc_saving:
+                self.session_connected_time = time.time()
+                logger.info(f"[PC SAVING] Session started at {time.strftime('%H:%M:%S', time.localtime(self.session_connected_time))}")
+                
+        # 2. 退出会话状态（比如断开连接、被挤掉、崩溃）
+        elif old_state == State.IN_SESSION:
+            if self.enable_pc_saving:
+                self.last_disconnect_time = time.time()
+                self.session_connected_time = None
+                logger.info(f"[PC SAVING] Session ended/disconnected at {time.strftime('%H:%M:%S', time.localtime(self.last_disconnect_time))}")
+
     # --- LOOP ---
     # 自动操作机器人，使用类似行为树的概念，不断检测和推进状态
     def run(self):
@@ -857,8 +913,10 @@ class VDIStateMachine:
                 # 2. State Transition
                 if new_state != self.state:
                     logger.info(f"TRANSITION: {self.state.name} -> {new_state.name}")
-                    if new_state == State.IN_SESSION:
-                        self.write_success_marker()
+                    
+                    # 触发解耦的业务转换钩子
+                    self.on_state_transition(self.state, new_state)
+                    
                     self.state = new_state
                     # 记录机器人进入当前状态的那一刻时间。
                     self.state_start_time = time.time()
